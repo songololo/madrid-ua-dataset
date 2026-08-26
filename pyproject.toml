@@ -1,10 +1,10 @@
 [project]
 name = "ua-dataset-madrid"
-version = "3.0.0"
+version = "4.0.0"
 description = "Default template for PDM package"
 authors = [{ name = "", email = "" }]
 dependencies = [
-    "cityseer>=4.23.0",
+    "cityseer>=5.8.0",
     "geopandas>=1.0.1",
     "ipykernel>=6.29.5",
     "jupyter>=1.1.1",

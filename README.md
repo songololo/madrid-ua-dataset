@@ -28,6 +28,95 @@ The code is in `process/compute.py` file and can be run using code cells demarca
 
 The file can otherwise be run directly, though the file paths to the `data` folder may need to be adjusted (e.g. changing `../` to `./`).
 
+## Generated dataset columns
+
+The processing script writes `temp/dataset.gpkg` (and a central-districts subset, `temp/dataset_subset.gpkg`). All network measures are computed with cityseer 5.8.0 through the `CityNetwork` API. The street network is analysed as a dual graph: each row of the dataset is one street segment, represented internally as a dual graph node placed at the segment midpoint. Only live nodes (segment midpoints inside the city boundary) that fall within a named district are saved. Numeric columns are stored as float32.
+
+### Notation
+
+- $i$, $j$, $s$, $t$ index street segments (dual graph nodes). Row $i$ holds the measures for segment $i$.
+- $w_j$ is the length in metres of street segment $j$ (the `seg_length` column).
+- $d_{ij}$ is the shortest network path distance in metres between the midpoints of segments $i$ and $j$, measured along the street network.
+- $a_{ij}$ is the cumulative angular change in degrees along the simplest (minimum angular change) route between $i$ and $j$. The metric length of that route is $m_{ij}$.
+- $d_{max}$ is the distance threshold: one column per $d_{max} \in \{200, 500, 1000, 2000, 5000, 10000\}$ metres for centralities, and $d_{max} \in \{100, 200, 500, 1000, 2000\}$ for land-use measures.
+- $\beta = 4 / d_{max}$ is the decay constant paired with each threshold, so that $\exp(-\beta d) = 0.0183$ at $d = d_{max}$.
+- Metric measures aggregate over $R_i = \{j \neq i : d_{ij} \leq d_{max}\}$. Angular measures aggregate over $R^{ang}_i = \{j \neq i : m_{ij} \leq d_{max}\}$; the threshold applies to the metric length of the angularly simplest route, and the routing cost is angular.
+
+### Shortest path (metric) centralities
+
+Computed by `CityNetwork.centrality_shortest`. Unweighted columns count segments; length-weighted (`cc_lw_*`) columns weight each reachable segment by the street length it represents, applied at the destination.
+
+| Column | Formula |
+| --- | --- |
+| `cc_density_{d}` | $\sum_{j \in R_i} 1$ |
+| `cc_farness_{d}` | $\sum_{j \in R_i} d_{ij}$ |
+| `cc_harmonic_{d}` | $\sum_{j \in R_i} 1 / d_{ij}$ |
+| `cc_beta_{d}` | $\sum_{j \in R_i} \exp(-\beta d_{ij})$ |
+| `cc_hillier_{d}` | `cc_density`$^2$ / `cc_farness` |
+| `cc_cycles_{d}` | circuit rank (count of independent cycles) of the subgraph reachable within $d_{max}$ |
+| `cc_betweenness_{d}` | $\sum_{\{s,t\}} \sigma_{st}(i) / \sigma_{st}$ |
+| `cc_betweenness_beta_{d}` | $\sum_{\{s,t\}} \exp(-\beta d_{st}) \, \sigma_{st}(i) / \sigma_{st}$ |
+| `cc_lw_density_{d}` | $\sum_{j \in R_i} w_j$ (total reachable street length) |
+| `cc_lw_farness_{d}` | $\sum_{j \in R_i} w_j d_{ij}$ |
+| `cc_lw_harmonic_{d}` | $\sum_{j \in R_i} w_j / d_{ij}$ |
+| `cc_lw_beta_{d}` | $\sum_{j \in R_i} w_j \exp(-\beta d_{ij})$ |
+| `cc_lw_hillier_{d}` | `cc_lw_density`$^2$ / `cc_lw_farness` |
+| `cc_lw_betweenness_{d}` | $\sum_{\{s,t\}} w_s w_t \, \sigma_{st}(i) / \sigma_{st}$ |
+| `cc_lw_betweenness_beta_{d}` | $\sum_{\{s,t\}} w_s w_t \exp(-\beta d_{st}) \, \sigma_{st}(i) / \sigma_{st}$ |
+
+Betweenness convention: the sums run over unordered pairs $\{s, t\}$ with $s \neq i$, $t \neq i$, and $d_{st} \leq d_{max}$. $\sigma_{st}$ is the number of shortest paths between $s$ and $t$ (paths within the solver's floating point tolerance of the best cost count as equal), and $\sigma_{st}(i)$ is the number of those passing through $i$ as an intermediate node; endpoints receive no credit for their own pairs. Pairs are counted wherever both endpoints lie in the buffered analysis extent, so routes that enter and leave the boundary, including routes between two buffer locations that pass through it, contribute. In the length-weighted variants each pair is weighted by the product $w_s w_t$ of the endpoint segment lengths.
+
+### Simplest path (angular) centralities
+
+Computed by `CityNetwork.centrality_simplest`; columns carry the `_ang` suffix. Routing minimises cumulative angular change on the dual graph, with the Space Syntax convention that maps $0$ to $180$ degrees onto $0$ to $2$ (a scaling unit of 90).
+
+| Column | Formula |
+| --- | --- |
+| `cc_density_{d}_ang` | $\sum_{j \in R^{ang}_i} 1$ |
+| `cc_farness_{d}_ang` | $\sum_{j \in R^{ang}_i} a_{ij} / 90$ |
+| `cc_harmonic_{d}_ang` | $\sum_{j \in R^{ang}_i} 1 / (1 + a_{ij} / 90)$ |
+| `cc_hillier_{d}_ang` | `cc_density_ang`$^2$ / `cc_farness_ang` |
+| `cc_betweenness_{d}_ang` | $\sum_{\{s,t\}} \sigma^{ang}_{st}(i) / \sigma^{ang}_{st}$ |
+| `cc_lw_density_{d}_ang` | $\sum_{j \in R^{ang}_i} w_j$ |
+| `cc_lw_farness_{d}_ang` | $\sum_{j \in R^{ang}_i} w_j a_{ij} / 90$ |
+| `cc_lw_harmonic_{d}_ang` | $\sum_{j \in R^{ang}_i} w_j / (1 + a_{ij} / 90)$ |
+| `cc_lw_hillier_{d}_ang` | `cc_lw_density_ang`$^2$ / `cc_lw_farness_ang` |
+| `cc_lw_betweenness_{d}_ang` | $\sum_{\{s,t\}} w_s w_t \, \sigma^{ang}_{st}(i) / \sigma^{ang}_{st}$ |
+
+The betweenness convention matches the metric case, with $\sigma^{ang}_{st}$ counting angularly simplest routes whose metric length is within $d_{max}$, and near-equal angular costs (within the solver tolerance) treated as ties.
+
+### Land-use measures
+
+Computed by `CityNetwork.compute_accessibilities` and `CityNetwork.compute_mixed_uses` from the cleaned premises data (`division_desc` categories). Premises are assigned to the network within a maximum assignment distance of 100 m, and $d_k$ denotes the network distance from segment $i$ to premise $k$ including the assignment offset. Angular variants (`_ang`) route by minimum angular change with the same aggregation formulas. $\beta = 4 / d_{max}$ as above.
+
+| Column | Formula |
+| --- | --- |
+| `cc_{key}_{d}_nw` | $\sum_{k \in K, d_k \leq d_{max}} 1$, the count of reachable premises of category $key$ |
+| `cc_{key}_{d}_wt` | $\sum_{k \in K, d_k \leq d_{max}} \exp(-\beta d_k)$ |
+| `cc_{key}_nearest_max_2000` | $\min_k d_k$, the network distance to the nearest premise of category $key$ within the largest threshold (2000 m) |
+| `cc_hill_q{q}_{d}_wt` | distance-weighted Hill diversity of order $q$ over the reachable premises, see below |
+
+Weighted Hill diversity follows the branch-weighted formulation: with $N_a$ the count of reachable premises of class $a$, $p_a = N_a / \sum_b N_b$, $d_a$ the network distance to the nearest reachable premise of class $a$, $u_a = \exp(-\beta d_a)$, and $T = \sum_a u_a p_a$,
+
+$$D_q = \Big( \sum_a u_a (p_a / T)^q \Big)^{1/(1-q)} \quad (q \neq 1), \qquad D_1 = \exp\Big( -\sum_a \frac{u_a p_a}{T} \ln \frac{u_a p_a}{T} \Big).$$
+
+### Other columns
+
+| Column | Description |
+| --- | --- |
+| `index` | dual graph node key, formed from the primal end node keys and edge index |
+| `ns_node_idx` | internal cityseer node index |
+| `x`, `y` | segment midpoint coordinates (EPSG:25830) |
+| `live` | midpoint lies inside the city boundary (all saved rows are live) |
+| `seg_length` | street segment length in metres ($w$ above); named `weight` in builds before cityseer 5 |
+| `primal_edge_node_a`, `primal_edge_node_b`, `primal_edge_idx` | primal end node keys and edge index |
+| `dual_node` | segment midpoint as WKT |
+| `bearing` | bearing in degrees between the segment end points |
+| `district`, `neighb` | district and neighbourhood containing the segment centroid |
+| `pop_dens` | GHS-POP population density at the midpoint, per km² |
+| `clased`, `nombre` | road class and street name carried from the IGN source data |
+| `geometry` | the primal street segment LineString, simplified to 2 m tolerance |
+
 ## Data Sources
 
 ### Madrid Data

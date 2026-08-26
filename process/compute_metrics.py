@@ -2,19 +2,22 @@
 """
 Extracts:
 - population density
-- network centralities in metric, angular, segment, and length weighted forms
+- network centralities in metric, angular, and length weighted forms
 - landuse access in metric, angular, mixed use form from premises data
+
+Computed with cityseer 5.8.0 via the CityNetwork API. The exact formula for every
+cc_* column is documented in README.md ("Generated dataset columns").
 """
 
 from __future__ import annotations
 
 import geopandas as gpd
 import numpy as np
-from cityseer.metrics import layers, networks
+from cityseer.network import CityNetwork
 from cityseer.tools import graphs, io, util
 from rasterio import MemoryFile
 from rasterstats import point_query
-from shapely import geometry, wkt
+from shapely import geometry
 from tqdm import tqdm
 
 from process import premises_lu_schema
@@ -32,12 +35,39 @@ PATH_POPULATION = "./data/population_clipped.tif"
 CENT_DISTANCES = [200, 500, 1000, 2000, 5000, 10000]
 LU_DISTANCES = [100, 200, 500, 1000, 2000]
 
+# metric (shortest path) centrality measures; c is metric distance, p = c / d_max
+SHORTEST_CLOSENESS = {
+    "density": "1",
+    "farness": "c",
+    "harmonic": "1/c",
+    "beta": "exp(-4 * p)",
+}
+SHORTEST_BETWEENNESS = {
+    "betweenness": "1",
+    "betweenness_beta": "exp(-4 * p)",
+}
+# angular (simplest path) measures; c is cumulative angular change in degrees,
+# scaled per the Space Syntax convention where 0 - 180 degrees maps to 0 - 2
+SIMPLEST_CLOSENESS = {
+    "density": "1",
+    "farness": "c / 90",
+    "harmonic": "1 / (1 + c / 90)",
+}
+SIMPLEST_BETWEENNESS = {
+    "betweenness": "1",
+}
+
+
+def prefix_labels(exprs: dict[str, str]) -> dict[str, str]:
+    return {f"lw_{k}": v for k, v in exprs.items()}
+
+
 # %%
 # open streets
 edges_gdf = gpd.read_file(PATH_STREETS)
 # convert multipart geoms to single
-edges_gdf_singles = edges_gdf.explode(drop=True)
-# generate networkx
+edges_gdf_singles = edges_gdf.explode(ignore_index=True)
+# generate networkx; primal cleaning matches earlier builds of this dataset
 G_nx = io.nx_from_generic_geopandas(edges_gdf_singles)
 # removes degree 2 if found
 G_nx = graphs.nx_remove_filler_nodes(G_nx)
@@ -46,68 +76,47 @@ G_nx = graphs.nx_remove_dangling_nodes(G_nx)
 # %%
 # city boundary
 bounds = gpd.read_file(PATH_NEIGHBOURHOODS)
-bounds_union_geom = bounds.buffer(10).geometry.unary_union
+bounds_union_geom = bounds.buffer(10).geometry.union_all()
 
 # %%
-# decided not to decompose
-# prepare dual
-G_nx_dual = graphs.nx_to_dual(G_nx)
+# build the dual graph network; cleaning is disabled because the primal graph
+# above is already cleaned, so the graph passes through unchanged
+cn = CityNetwork.from_nx(
+    G_nx,
+    boundary=bounds_union_geom,
+    remove_fillers=False,
+    remove_danglers=0,
+    merge_parallel_dist=0,
+)
+nodes_gdf = cn.nodes_gdf
 
 # %%
-# computations only run for live nodes
-for nd_key, nd_data in tqdm(G_nx_dual.nodes(data=True), total=G_nx_dual.number_of_nodes()):
-    point = geometry.Point(nd_data["x"], nd_data["y"])
-    # set live nodes for nodes within boundary
-    if not bounds_union_geom.contains(point):
-        G_nx_dual.nodes[nd_key]["live"] = False
-    # extract edge bearings for visualisation
-    primal_edge = nd_data["primal_edge"]
-    G_nx_dual.nodes[nd_key]["bearing"] = util.measure_bearing(
-        list(primal_edge.coords)[0], list(primal_edge.coords)[-1]
+# primal street geometries (one LineString per dual node) for bearings and joins
+primal_gdf = cn.to_geopandas()
+# extract edge bearings for visualisation
+nodes_gdf["bearing"] = [
+    util.measure_bearing(
+        np.array(line.coords[0][:2]),
+        np.array(line.coords[-1][:2]),
     )
-
-# %%
-# extract unweighted structure
-_nodes_gdf, _edges_gdf, network_structure = io.network_structure_from_nx(
-    G_nx_dual,
-)
-
-# %%
-# create separate network structure with length weighted data
-for nd_key, nd_data in tqdm(G_nx_dual.nodes(data=True), total=G_nx_dual.number_of_nodes()):
-    # set node weight accord to primal edge lengths
-    primal_edge = nd_data["primal_edge"]
-    G_nx_dual.nodes[nd_key]["weight"] = primal_edge.length
-
-# extract length weighted structure
-nodes_gdf, edges_gdf, network_structure_len_wt = io.network_structure_from_nx(
-    G_nx_dual,
-)
-
-
-# %%
-# copy bearing info for primal
-def copy_primal_bearings(row):
-    return G_nx_dual.nodes[row.name]["bearing"]
-
-
-nodes_gdf["bearing"] = nodes_gdf.apply(copy_primal_bearings, axis=1)
+    for line in primal_gdf.geometry
+]
 # copy neighbourhood identifiers to nodes
-nodes_centroids = nodes_gdf.geometry.centroid
-nodes_centroids_gdf = gpd.GeoDataFrame(geometry=nodes_centroids, crs=nodes_gdf.crs)
-joined_gdf = gpd.sjoin(nodes_centroids_gdf, bounds, how="left", predicate="intersects")
+primal_centroids_gdf = gpd.GeoDataFrame(geometry=primal_gdf.geometry.centroid, crs=primal_gdf.crs)
+joined_gdf = gpd.sjoin(primal_centroids_gdf, bounds, how="left", predicate="intersects")
+joined_gdf = joined_gdf[~joined_gdf.index.duplicated(keep="first")]
 nodes_gdf["district"] = joined_gdf["NOMDIS"]
 nodes_gdf["neighb"] = joined_gdf["NOMBRE"]
 
 # %%
-# population data
+# population data - sampled at the dual node (street segment midpoint)
 with open(PATH_POPULATION, "rb") as f:
     memfile = MemoryFile(f.read())
     with memfile.open() as dataset:
         pop_raster = dataset.read()
         for node_idx, node_row in tqdm(nodes_gdf.iterrows(), total=len(nodes_gdf)):
             pop_val = point_query(
-                wkt.loads(node_row["dual_node"]),
+                node_row.geometry,
                 pop_raster,
                 interpolate="nearest",
                 nodata=-200,
@@ -120,59 +129,40 @@ with open(PATH_POPULATION, "rb") as f:
 nodes_gdf["pop_dens"] = nodes_gdf["pop_dens"] * 100
 
 # %%
-# run shortest path centrality
-nodes_gdf = networks.node_centrality_shortest(
-    network_structure_len_wt,
-    nodes_gdf,
+# length weighted centralities: segment_weighted=True weights each destination by the
+# street length it represents (see README.md for per-column formulas)
+cn.centrality_shortest(
     distances=CENT_DISTANCES,
+    closeness=prefix_labels(SHORTEST_CLOSENESS),
+    betweenness=prefix_labels(SHORTEST_BETWEENNESS),
+    cycles=False,
+    postprocess={"lw_hillier": "lw_density**2 / lw_farness"},
+    segment_weighted=True,
 )
-# run simplest path centrality
-nodes_gdf = networks.node_centrality_simplest(
-    network_structure_len_wt,
-    nodes_gdf,
+cn.centrality_simplest(
     distances=CENT_DISTANCES,
-    angular_scaling_unit=90,  # to match Space Syntax convention of 0 - 180 = 0 - 2
-    farness_scaling_offset=0,  # to match Space Syntax convention of 0 - 180 = 0 - 2
-)
-
-# %%
-# rename length weighted columns for saving (prevents overwriting)
-for col_extract in [
-    "cc_density",
-    "cc_beta",
-    "cc_farness",
-    "cc_harmonic",
-    "cc_hillier",
-    "cc_betweenness",
-    "cc_betweenness_beta",
-]:
-    new_col_extract = col_extract.replace("cc_", "cc_lw_")
-    nodes_gdf.columns = [col.replace(col_extract, new_col_extract) for col in nodes_gdf.columns]
-
-
-# %%
-# rerun without length weightings - renamed lw columns won't be overwritten
-# run shortest path centrality
-nodes_gdf = networks.node_centrality_shortest(
-    network_structure,
-    nodes_gdf,
-    distances=CENT_DISTANCES,
-)
-# run simplest path centrality
-nodes_gdf = networks.node_centrality_simplest(
-    network_structure,
-    nodes_gdf,
-    distances=CENT_DISTANCES,
-    angular_scaling_unit=90,  # to match Space Syntax convention of 0 - 180 = 0 - 2
-    farness_scaling_offset=0,  # to match Space Syntax convention of 0 - 180 = 0 - 2
+    closeness=prefix_labels(SIMPLEST_CLOSENESS),
+    betweenness=prefix_labels(SIMPLEST_BETWEENNESS),
+    postprocess={"lw_hillier": "lw_density**2 / lw_farness"},
+    segment_weighted=True,
 )
 
 # %%
-# run segment path centrality
-nodes_gdf = networks.segment_centrality(
-    network_structure,
-    nodes_gdf,
+# unweighted centralities
+cn.centrality_shortest(
     distances=CENT_DISTANCES,
+    closeness=SHORTEST_CLOSENESS,
+    betweenness=SHORTEST_BETWEENNESS,
+    cycles=True,
+    postprocess={"hillier": "density**2 / farness"},
+    segment_weighted=False,
+)
+cn.centrality_simplest(
+    distances=CENT_DISTANCES,
+    closeness=SIMPLEST_CLOSENESS,
+    betweenness=SIMPLEST_BETWEENNESS,
+    postprocess={"hillier": "density**2 / farness"},
+    segment_weighted=False,
 )
 
 # %%
@@ -221,83 +211,86 @@ premises_eng.to_file(PATH_OUT_PREMISES)
 
 # %%
 # compute mixed uses
-nodes_gdf, premises_eng = layers.compute_mixed_uses(
+# decay_fn=None emits both the unweighted (_nw) and beta weighted (_wt) hill columns
+cn.compute_mixed_uses(
     premises_eng,
     landuse_column_label="division_desc",
-    nodes_gdf=nodes_gdf,
-    network_structure=network_structure,
     distances=LU_DISTANCES,
-    compute_hill=False,
-    compute_hill_weighted=True,
+    decay_fn=None,
 )
 # compute mixed uses using simplest paths
-nodes_gdf, premises_eng = layers.compute_mixed_uses(
+cn.compute_mixed_uses(
     premises_eng,
     landuse_column_label="division_desc",
-    nodes_gdf=nodes_gdf,
-    network_structure=network_structure,
     distances=LU_DISTANCES,
-    compute_hill=False,
-    compute_hill_weighted=True,
+    decay_fn=None,
     angular=True,
 )
 # compute accessibility
-nodes_gdf, premises_eng = layers.compute_accessibilities(
+ACCESS_KEYS = [
+    "food_bev",
+    "creat_entert",
+    "retail",
+    "services",
+    "education",
+    "accommod",
+    "sports_rec",
+    "health",
+]
+cn.compute_accessibilities(
     premises_eng,
     landuse_column_label="division_desc",
-    accessibility_keys=[
-        "food_bev",
-        "creat_entert",
-        "retail",
-        "services",
-        "education",
-        "accommod",
-        "sports_rec",
-        "health",
-    ],
-    nodes_gdf=nodes_gdf,
-    network_structure=network_structure,
+    accessibility_keys=ACCESS_KEYS,
     distances=LU_DISTANCES,
+    decay_fn=None,
 )
 # compute accessibility using simplest paths
-nodes_gdf, premises_eng = layers.compute_accessibilities(
+cn.compute_accessibilities(
     premises_eng,
     landuse_column_label="division_desc",
-    accessibility_keys=[
-        "food_bev",
-        "creat_entert",
-        "retail",
-        "services",
-        "education",
-        "accommod",
-        "sports_rec",
-        "health",
-    ],
-    nodes_gdf=nodes_gdf,
-    network_structure=network_structure,
+    accessibility_keys=ACCESS_KEYS,
     distances=LU_DISTANCES,
+    decay_fn=None,
     angular=True,
 )
 
 # %%
-# save only live nodes
-nodes_gdf_live = nodes_gdf[nodes_gdf.live]
-# filter out non located per districts
-nodes_gdf_live = nodes_gdf[~nodes_gdf.district.isna()]
+# assemble the output: computed columns joined to the primal street geometries
+out_gdf = cn.to_geopandas()
+# dual node location (street segment midpoint) as WKT, as in earlier builds
+out_gdf["dual_node"] = nodes_gdf.geometry.to_wkt()
+out_gdf["bearing"] = nodes_gdf["bearing"]
+out_gdf["district"] = nodes_gdf["district"]
+out_gdf["neighb"] = nodes_gdf["neighb"]
+out_gdf["pop_dens"] = nodes_gdf["pop_dens"]
+# drop unweighted hill columns to match the established dataset schema (weighted retained)
+drop_cols = [col for col in out_gdf.columns if col.startswith("cc_hill_") and col.endswith("_nw")]
+out_gdf = out_gdf.drop(columns=drop_cols)
+# drop the nominal node weight column (always 1); seg_length carries the street lengths
+out_gdf = out_gdf.drop(columns=["weight"])
+# drop empty networkx attribute columns and the build status column
+out_gdf = out_gdf.drop(
+    columns=["names", "routes", "highways", "levels", "feature_status"], errors="ignore"
+)
+
+# %%
+# save only live nodes located within a district
+out_gdf_live = out_gdf[out_gdf.live]
+out_gdf_live = out_gdf_live[~out_gdf_live.district.isna()]
 # simplify geom if necessary
-nodes_gdf_live.geometry = nodes_gdf_live.geometry.simplify(2)
+out_gdf_live.geometry = out_gdf_live.geometry.simplify(2)
 # pare back data types to reduce size
-for col in nodes_gdf_live.select_dtypes(include=["int64"]).columns:
-    nodes_gdf_live[col] = nodes_gdf_live[col].astype("int32")
-for col in nodes_gdf_live.select_dtypes(include=["float64"]).columns:
-    nodes_gdf_live[col] = nodes_gdf_live[col].astype("float32")
-# save
-nodes_gdf_live.to_file(PATH_OUT_DATASET)
+for col in out_gdf_live.select_dtypes(include=["int64"]).columns:
+    out_gdf_live[col] = out_gdf_live[col].astype("int32")
+for col in out_gdf_live.select_dtypes(include=["float64"]).columns:
+    out_gdf_live[col] = out_gdf_live[col].astype("float32")
+# save; index=True writes the dual node key as the "index" column
+out_gdf_live.to_file(PATH_OUT_DATASET, index=True)
 
 # %%
 # save subset
-nodes_gdf_subset = nodes_gdf_live[
-    nodes_gdf_live["district"].isin(
+nodes_gdf_subset = out_gdf_live[
+    out_gdf_live["district"].isin(
         [
             "Centro",
             "Arganzuela",
@@ -309,4 +302,4 @@ nodes_gdf_subset = nodes_gdf_live[
         ]
     )
 ]
-nodes_gdf_subset.to_file(PATH_OUT_DATASET_SUBSET)
+nodes_gdf_subset.to_file(PATH_OUT_DATASET_SUBSET, index=True)
